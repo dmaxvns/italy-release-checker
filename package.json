@@ -1,8 +1,0 @@
-{
-  "name": "italy-release-checker",
-  "version": "1.4.0",
-  "type": "module",
-  "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "dependencies": { "express": "^4.21.2" }
-}
