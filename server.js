@@ -255,29 +255,18 @@ app.get('/meta/movie/:id.json', async (req, res) => {
       });
     }
 
-    // Percorso veloce (usato da Nuvio durante lo scorrimento): non aspettiamo mai più di TIMEOUT_MS.
-    // Trama/poster sono già pronti sopra (m), quindi sono SEMPRE disponibili immediatamente.
-    const TIMEOUT_MS = 500;
-    const TIMEOUT_SENTINEL = Symbol('timeout');
-    const verdictPromise = computeVerdict(tmdbId, m).then(async (v) => {
-      if (!v.quotaExhausted) {
-        await cacheSetFull(req.params.id, { meta: buildMeta(req.params.id, tmdbId, m, v.releaseText) });
-      }
-      return v;
-    }).catch(() => null);
-
-    const raced = await Promise.race([
-      verdictPromise,
-      new Promise(resolve => setTimeout(() => resolve(TIMEOUT_SENTINEL), TIMEOUT_MS))
+    // ESPERIMENTO: ritardo minimo artificiale di 4s sui film non in cache (non un taglio per
+    // rispondere prima, il contrario: costringiamo ad aspettare più a lungo) per capire se Nuvio
+    // abbandona le richieste quando scorri veloce senza fermarti, mostrando il badge solo se ti
+    // soffermi/apri abbastanza a lungo.
+    const ARTIFICIAL_DELAY_MS = 4000;
+    const delay = new Promise(resolve => setTimeout(resolve, ARTIFICIAL_DELAY_MS));
+    const [v] = await Promise.all([
+      computeVerdict(tmdbId, m).catch(() => ({ releaseText: undefined, quotaExhausted: true })),
+      delay
     ]);
-
-    if (raced === TIMEOUT_SENTINEL || !raced) {
-      // Non ha fatto in tempo: rispondiamo subito con trama/poster ma senza badge.
-      // Il controllo prosegue comunque in background (verdictPromise) e salva il risultato
-      // in cache per la prossima volta (anche solo qualche secondo dopo).
-      return res.json({ meta: buildMeta(req.params.id, tmdbId, m, undefined) });
-    }
-    return res.json({ meta: buildMeta(req.params.id, tmdbId, m, raced.releaseText) });
+    if (!v.quotaExhausted) await cacheSetFull(req.params.id, { meta: buildMeta(req.params.id, tmdbId, m, v.releaseText) });
+    return res.json({ meta: buildMeta(req.params.id, tmdbId, m, v.releaseText) });
   } catch (e) {
     res.status(500).json({ meta: null, error: 'Release check failed' });
   }
@@ -296,4 +285,4 @@ function buildMeta(rawId, tmdbId, m, releaseText) {
   };
 }
 
-app.listen(PORT, () => console.log('Italy Release Checker 3.12 listening on ' + PORT));
+app.listen(PORT, () => console.log('Italy Release Checker 3.15 listening on ' + PORT));
