@@ -1,0 +1,28 @@
+name: Backup cache film
+
+on:
+  schedule:
+    - cron: '0 7 * * 1' # ogni lunedì alle 7:00 UTC (dopo il keepalive)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scarica il backup dall'addon
+        run: |
+          mkdir -p backups
+          curl -f https://italy-release-checker.onrender.com/backup -o backups/backup-$(date +%F).json
+
+      - name: Salva il backup nel repository
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add backups/
+          git commit -m "Backup automatico $(date +%F)" || echo "Nessun film nuovo da salvare"
+          git push
