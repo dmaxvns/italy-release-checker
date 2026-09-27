@@ -12,7 +12,7 @@ const OVERRIDES = {
 
 const MANIFEST = {
   id: 'com.italyreleasechecker.nuvio',
-  version: '3.19.0',
+  version: '3.20.0',
   name: '🇮🇹 Italy Release Checker',
   description: 'Controlla se un film ha un doppiaggio italiano (dataset IMDb + TMDB + Streaming Availability API).',
   resources: [
@@ -39,6 +39,39 @@ app.get('/keepalive', async (req, res) => {
     res.json({ ok: true, pinged_at: new Date().toISOString() });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Esporta tutta la cache Upstash (tutti i film salvati) in un unico JSON, per il backup settimanale.
+async function upstashCmd(cmd) {
+  const r = await fetch(UPSTASH_URL, {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + UPSTASH_TOKEN, 'Content-Type': 'application/json' },
+    body: JSON.stringify(cmd)
+  });
+  return (await r.json()).result;
+}
+
+app.get('/backup', async (req, res) => {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return res.status(400).json({ error: 'Upstash non configurato' });
+  try {
+    let cursor = '0', keys = [];
+    do {
+      const [next, batch] = await upstashCmd(['SCAN', cursor, 'MATCH', 'full:*', 'COUNT', 200]);
+      cursor = next;
+      keys.push(...batch);
+    } while (cursor !== '0');
+
+    const films = {};
+    const CHUNK = 100;
+    for (let i = 0; i < keys.length; i += CHUNK) {
+      const chunk = keys.slice(i, i + CHUNK);
+      const values = await upstashCmd(['MGET', ...chunk]);
+      chunk.forEach((k, idx) => { films[k] = values[idx] ? JSON.parse(values[idx]) : null; });
+    }
+    res.json({ generated_at: new Date().toISOString(), count: keys.length, films });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -317,4 +350,4 @@ function buildMeta(rawId, tmdbId, m, releaseText) {
   };
 }
 
-app.listen(PORT, () => console.log('Italy Release Checker 3.19 listening on ' + PORT));
+app.listen(PORT, () => console.log('Italy Release Checker 3.20 listening on ' + PORT));
