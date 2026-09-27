@@ -1,0 +1,13 @@
+name: Keepalive Upstash
+
+on:
+  schedule:
+    - cron: '0 6 * * 1' # ogni lunedì alle 6:00 UTC
+  workflow_dispatch: {} # permette anche di lanciarlo a mano da GitHub per testare
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping keepalive endpoint
+        run: curl -f https://italy-release-checker.onrender.com/keepalive
