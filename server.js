@@ -12,7 +12,7 @@ const OVERRIDES = {
 
 const MANIFEST = {
   id: 'com.italyreleasechecker.nuvio',
-  version: '3.9.0',
+  version: '3.19.0',
   name: '🇮🇹 Italy Release Checker',
   description: 'Controlla se un film ha un doppiaggio italiano (dataset IMDb + TMDB + Streaming Availability API).',
   resources: [
@@ -25,6 +25,22 @@ const MANIFEST = {
 app.get('/', (q, r) => r.json({ name: MANIFEST.name, version: MANIFEST.version, status: 'ok' }));
 app.get('/manifest.json', (q, r) => r.json(MANIFEST));
 app.get('/status', (q, r) => r.json({ streaming_api_configured: !!STREAM_KEY, persistent_cache_configured: !!(UPSTASH_URL && UPSTASH_TOKEN) }));
+
+// Chiamato periodicamente da un GitHub Action esterno: fa un comando Redis vero su Upstash
+// per resettare il contatore dei 14 giorni di inattività ed evitare l'archiviazione automatica.
+app.get('/keepalive', async (req, res) => {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return res.json({ upstash_configured: false });
+  try {
+    await fetch(UPSTASH_URL, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + UPSTASH_TOKEN, 'Content-Type': 'application/json' },
+      body: JSON.stringify(['SET', 'keepalive', new Date().toISOString()])
+    });
+    res.json({ ok: true, pinged_at: new Date().toISOString() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 // ============ TMDB ============
 async function tmdb(path) {
@@ -129,7 +145,10 @@ async function streamingAudioIT(tmdbId) {
 }
 
 // ============ CACHE (riduce chiamate ripetute alla Streaming API) ============
-const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 giorni
+const CACHE_TTL_NEGATIVE_MS = 30 * 24 * 60 * 60 * 1000; // 30 giorni, solo per i verdetti "non uscito"
+const isPositiveVerdict = (releaseText) => !!releaseText && releaseText.startsWith('🇮🇹');
+// Durata da usare per un dato verdetto: per sempre se "uscito", 30 giorni altrimenti.
+const ttlFor = (releaseText) => isPositiveVerdict(releaseText) ? Infinity : CACHE_TTL_NEGATIVE_MS;
 const releaseCache = new Map(); // tmdbId -> { releaseText, decidedBy, ts } (solo in-memory, ok se si perde)
 const memFullCache = new Map(); // id grezzo -> { json, ts } (livello 1, veloce, si perde ai riavvii)
 
@@ -140,7 +159,7 @@ const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 // altrimenti solo in-memory (si perde ai riavvii, ma funziona comunque senza setup).
 async function cacheGetFull(key) {
   const e = memFullCache.get(key);
-  if (e && (Date.now() - e.ts) < CACHE_TTL_MS) return e.json;
+  if (e && (Date.now() - e.ts) < ttlFor(e.json?.meta?.releaseInfo)) return e.json;
   if (UPSTASH_URL && UPSTASH_TOKEN) {
     try {
       const r = await fetch(`${UPSTASH_URL}/get/${encodeURIComponent('full:' + key)}`, { headers: { Authorization: 'Bearer ' + UPSTASH_TOKEN } });
@@ -172,10 +191,14 @@ async function cacheSetFull(key, json) {
   memFullCache.set(key, { json, ts: Date.now() });
   if (UPSTASH_URL && UPSTASH_TOKEN) {
     try {
+      const ttlSeconds = ttlFor(json?.meta?.releaseInfo);
+      const cmd = ttlSeconds === Infinity
+        ? ['SET', 'full:' + key, JSON.stringify(json)] // nessuna scadenza: resta per sempre
+        : ['SET', 'full:' + key, JSON.stringify(json), 'EX', Math.floor(ttlSeconds / 1000)];
       await fetch(UPSTASH_URL, {
         method: 'POST',
         headers: { Authorization: 'Bearer ' + UPSTASH_TOKEN, 'Content-Type': 'application/json' },
-        body: JSON.stringify(['SET', 'full:' + key, JSON.stringify(json), 'EX', Math.floor(CACHE_TTL_MS / 1000)])
+        body: JSON.stringify(cmd)
       });
     } catch {}
   }
@@ -184,16 +207,16 @@ async function cacheSetFull(key, json) {
 // Esegue tutto il controllo (cache film, TMDB, Wikidata, eventualmente Streaming API)
 // e restituisce sempre lo stesso identico risultato di prima — usata sia dal percorso
 // debug (senza limiti di tempo) sia dal percorso veloce (con timeout, vedi sotto).
-async function computeVerdict(tmdbId, m) {
+async function computeVerdict(tmdbId, m, preStartedTmdbCheck) {
   const cached = releaseCache.get(tmdbId);
-  if (cached && (Date.now() - cached.ts) < CACHE_TTL_MS) {
+  if (cached && (Date.now() - cached.ts) < ttlFor(cached.releaseText)) {
     return {
       releaseText: cached.releaseText, cacheHit: true, quotaExhausted: false, decidedBy: cached.decidedBy,
       dTmdb: { status: 'fulfilled', value: undefined }, dWiki: { status: 'fulfilled', value: undefined },
       dStream: { status: 'fulfilled', value: undefined }, streamRaw: null
     };
   }
-  const [dTmdb, dWiki] = await Promise.allSettled([tmdbTheatricalTvIT(tmdbId), wikidataIT(m.imdb_id)]);
+  const [dTmdb, dWiki] = await Promise.allSettled([preStartedTmdbCheck || tmdbTheatricalTvIT(tmdbId), wikidataIT(m.imdb_id)]);
   let released = (dTmdb.status === 'fulfilled' && dTmdb.value) || (dWiki.status === 'fulfilled' && dWiki.value);
   let decidedBy = dTmdb.status === 'fulfilled' && dTmdb.value ? 'tmdb_theatrical_tv'
     : (dWiki.status === 'fulfilled' && dWiki.value ? 'wikidata' : null);
@@ -225,6 +248,7 @@ app.get('/meta/movie/:id.json', async (req, res) => {
 
     const tmdbId = await resolveTmdbId(req.params.id);
     if (!tmdbId) return res.status(404).json({ meta: null, error: 'ID non risolvibile' });
+    const tmdbCheckPromise = tmdbTheatricalTvIT(tmdbId).catch(() => false); // parte già ora, non aspetta i dettagli del film
     const m = await tmdb('/movie/' + tmdbId);
     if (!m) return res.status(404).json({ meta: null, error: 'Movie not found' });
 
@@ -237,7 +261,7 @@ app.get('/meta/movie/:id.json', async (req, res) => {
 
     if (req.query.debug) {
       // Percorso debug: sempre calcolo completo, senza limiti di tempo.
-      const v = await computeVerdict(tmdbId, m);
+      const v = await computeVerdict(tmdbId, m, tmdbCheckPromise);
       const meta = buildMeta(req.params.id, tmdbId, m, v.releaseText);
       if (!v.quotaExhausted) await cacheSetFull(req.params.id, { meta });
       const upstashCheck = await upstashRawGet(req.params.id);
@@ -255,18 +279,26 @@ app.get('/meta/movie/:id.json', async (req, res) => {
       });
     }
 
-    // ESPERIMENTO: ritardo minimo artificiale di 4s sui film non in cache (non un taglio per
-    // rispondere prima, il contrario: costringiamo ad aspettare più a lungo) per capire se Nuvio
-    // abbandona le richieste quando scorri veloce senza fermarti, mostrando il badge solo se ti
-    // soffermi/apri abbastanza a lungo.
-    const ARTIFICIAL_DELAY_MS = 4000;
-    const delay = new Promise(resolve => setTimeout(resolve, ARTIFICIAL_DELAY_MS));
-    const [v] = await Promise.all([
-      computeVerdict(tmdbId, m).catch(() => ({ releaseText: undefined, quotaExhausted: true })),
-      delay
+    // Risposta entro TIMEOUT_MS: trama/poster sempre pronti subito, badge quando il controllo
+    // fa in tempo (altrimenti arriva al giro successivo, già in cache).
+    const TIMEOUT_MS = 500;
+    const TIMEOUT_SENTINEL = Symbol('timeout');
+    const verdictPromise = computeVerdict(tmdbId, m, tmdbCheckPromise).then(async (v) => {
+      if (!v.quotaExhausted) {
+        await cacheSetFull(req.params.id, { meta: buildMeta(req.params.id, tmdbId, m, v.releaseText) });
+      }
+      return v;
+    }).catch(() => null);
+
+    const raced = await Promise.race([
+      verdictPromise,
+      new Promise(resolve => setTimeout(() => resolve(TIMEOUT_SENTINEL), TIMEOUT_MS))
     ]);
-    if (!v.quotaExhausted) await cacheSetFull(req.params.id, { meta: buildMeta(req.params.id, tmdbId, m, v.releaseText) });
-    return res.json({ meta: buildMeta(req.params.id, tmdbId, m, v.releaseText) });
+
+    if (raced === TIMEOUT_SENTINEL || !raced) {
+      return res.json({ meta: buildMeta(req.params.id, tmdbId, m, undefined) });
+    }
+    return res.json({ meta: buildMeta(req.params.id, tmdbId, m, raced.releaseText) });
   } catch (e) {
     res.status(500).json({ meta: null, error: 'Release check failed' });
   }
@@ -285,4 +317,4 @@ function buildMeta(rawId, tmdbId, m, releaseText) {
   };
 }
 
-app.listen(PORT, () => console.log('Italy Release Checker 3.15 listening on ' + PORT));
+app.listen(PORT, () => console.log('Italy Release Checker 3.19 listening on ' + PORT));
