@@ -12,7 +12,7 @@ const OVERRIDES = {
 
 const MANIFEST = {
   id: 'com.italyreleasechecker.nuvio',
-  version: '3.20.0',
+  version: '3.21.0',
   name: '🇮🇹 Italy Release Checker',
   description: 'Controlla se un film ha un doppiaggio italiano (dataset IMDb + TMDB + Streaming Availability API).',
   resources: [
@@ -269,6 +269,17 @@ async function computeVerdict(tmdbId, m, preStartedTmdbCheck) {
   return { releaseText, cacheHit: false, quotaExhausted, decidedBy, dTmdb, dWiki, dStream, streamRaw };
 }
 
+const inFlightVerdicts = new Map(); // tmdbId -> Promise, condiviso tra richieste ravvicinate sullo stesso film
+function getOrStartVerdict(tmdbId, m, tmdbCheckPromise, rawId) {
+  if (inFlightVerdicts.has(tmdbId)) return inFlightVerdicts.get(tmdbId);
+  const p = computeVerdict(tmdbId, m, tmdbCheckPromise).then(async (v) => {
+    if (!v.quotaExhausted) await cacheSetFull(rawId, { meta: buildMeta(rawId, tmdbId, m, v.releaseText) });
+    return v;
+  }).catch(() => null).finally(() => inFlightVerdicts.delete(tmdbId));
+  inFlightVerdicts.set(tmdbId, p);
+  return p;
+}
+
 // ============ META ============
 app.get('/meta/movie/:id.json', async (req, res) => {
   try {
@@ -313,15 +324,11 @@ app.get('/meta/movie/:id.json', async (req, res) => {
     }
 
     // Risposta entro TIMEOUT_MS: trama/poster sempre pronti subito, badge quando il controllo
-    // fa in tempo (altrimenti arriva al giro successivo, già in cache).
+    // fa in tempo (altrimenti arriva al giro successivo, già in cache). Se riapri lo stesso film
+    // mentre il controllo precedente è ancora in corso, condividiamo quello — non ripartiamo da zero.
     const TIMEOUT_MS = 500;
     const TIMEOUT_SENTINEL = Symbol('timeout');
-    const verdictPromise = computeVerdict(tmdbId, m, tmdbCheckPromise).then(async (v) => {
-      if (!v.quotaExhausted) {
-        await cacheSetFull(req.params.id, { meta: buildMeta(req.params.id, tmdbId, m, v.releaseText) });
-      }
-      return v;
-    }).catch(() => null);
+    const verdictPromise = getOrStartVerdict(tmdbId, m, tmdbCheckPromise, req.params.id);
 
     const raced = await Promise.race([
       verdictPromise,
@@ -350,4 +357,4 @@ function buildMeta(rawId, tmdbId, m, releaseText) {
   };
 }
 
-app.listen(PORT, () => console.log('Italy Release Checker 3.20 listening on ' + PORT));
+app.listen(PORT, () => console.log('Italy Release Checker 3.21 listening on ' + PORT));
