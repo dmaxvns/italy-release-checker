@@ -12,7 +12,7 @@ const OVERRIDES = {
 
 const MANIFEST = {
   id: 'com.italyreleasechecker.nuvio',
-  version: '3.21.0',
+  version: '3.22.0',
   name: '🇮🇹 Italy Release Checker',
   description: 'Controlla se un film ha un doppiaggio italiano (dataset IMDb + TMDB + Streaming Availability API).',
   resources: [
@@ -282,6 +282,7 @@ function getOrStartVerdict(tmdbId, m, tmdbCheckPromise, rawId) {
 
 // ============ META ============
 app.get('/meta/movie/:id.json', async (req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
   try {
     // Cache "veloce": se conosciamo già la risposta completa per QUESTO id, la ritorniamo
     // subito senza toccare TMDB/Wikidata/Streaming API (velocità massima sui film già aperti).
@@ -357,4 +358,4 @@ function buildMeta(rawId, tmdbId, m, releaseText) {
   };
 }
 
-app.listen(PORT, () => console.log('Italy Release Checker 3.21 listening on ' + PORT));
+app.listen(PORT, () => console.log('Italy Release Checker 3.22 listening on ' + PORT));
